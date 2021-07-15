@@ -284,95 +284,96 @@ class XrdMonHandler(object):
     """
 
     def handle(self, data, addr):
-        header, rest = data[:8], data[8:]
-        # Parse header:
-        code, pseq, plen, stod = struct.unpack("!cchi", header)
-        result = None
-        #print("=== message recieved - type {}, length {} ===".format(code, plen))
-        if code == b'u':
-            info_len = plen-8-4
-            dictid, info = struct.unpack("!i%is" % info_len, rest)
-            uniq_id = "%s-%i.%i" % (addr[0], stod, dictid)
-            #print("uniq_id {}".format(uniq_id))
-            add_user_conn_record(uniq_id, info, addr)
-        elif code == b'f':
-           #print("=== fstream message start - length {} ===".format(plen))
-           timestamp = {}
-           req_pos = 0
-           while rest:
-               header, rest = rest[:8] , rest[8:]
-               recType, recFlag, recSize, = struct.unpack("!BBh", header[:4])
-               msgSize = recSize - 8 # the recSize includes the 8 byte header
-               msg, rest= rest[:msgSize], rest[msgSize:] 
-               #print("recType {} recFlag {} recSize {}".format(recTval[recType], recFlag, recSize))
-               # the fstream message headers vary depending on the type
-               if recType == FSTREAM_TIME:
-                   # this gets us the first message time, send time for the following messages
-                   # I'm not extracting the sID as we are currently not using it and it may not be present
-                   isXfrReqs, totalReqs = struct.unpack("!hh", header[4:]) # extract the 2nd half of the header
-                   timestamp['req_count'] = totalReqs - isXfrReqs # the XFR requests always come at the end, so can't be used to estimate time for the other requests
-                   timestamp['tBeg'], timestamp['tEnd'] = struct.unpack("!II", msg[:8]) 
+        try:
+            header, rest = data[:8], data[8:]
+            # Parse header:
+            code, pseq, plen, stod = struct.unpack("!cchi", header)
+            result = None
+            #print("=== message recieved - type {}, length {} ===".format(code, plen))
+            if code == b'u':
+                info_len = plen-8-4
+                dictid, info = struct.unpack("!i%is" % info_len, rest)
+                uniq_id = "%s-%i.%i" % (addr[0], stod, dictid)
+                #print("uniq_id {}".format(uniq_id))
+                add_user_conn_record(uniq_id, info, addr)
+            elif code == b'f':
+               #print("=== fstream message start - length {} ===".format(plen))
+               timestamp = {}
+               req_pos = 0
+               while rest:
+                   header, rest = rest[:8] , rest[8:]
+                   recType, recFlag, recSize, = struct.unpack("!BBh", header[:4])
+                   msgSize = recSize - 8 # the recSize includes the 8 byte header
+                   msg, rest= rest[:msgSize], rest[msgSize:] 
+                   #print("recType {} recFlag {} recSize {}".format(recTval[recType], recFlag, recSize))
+                   # the fstream message headers vary depending on the type
+                   if recType == FSTREAM_TIME:
+                       # this gets us the first message time, send time for the following messages
+                       # I'm not extracting the sID as we are currently not using it and it may not be present
+                       isXfrReqs, totalReqs = struct.unpack("!hh", header[4:]) # extract the 2nd half of the header
+                       timestamp['req_count'] = totalReqs - isXfrReqs # the XFR requests always come at the end, so can't be used to estimate time for the other requests
+                       timestamp['tBeg'], timestamp['tEnd'] = struct.unpack("!II", msg[:8]) 
 
-                   #print("XrdXrootdMonFileTOD: tBeg {}, tEnd {}".format(timestamp['tBeg'], timestamp['tEnd']))
-                   #print("Requests: {} XFr, {} total".format(isXfrReqs, totalReqs))
-                   
-               elif recType == FSTREAM_DISC:
-                   user_dictid, = struct.unpack("!I", header[4:])
-                   uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
-                   #print("XrdXrootdMonFileDSC: user_dictid {}".format(user_dictid))
-               else:
-                   # all other types have the file dictid in the header
-                   file_dictid, = struct.unpack("!I", header[4:])
-                   uniq_id = "%s-%i.%i" % (addr[0], stod, file_dictid)
-                   #print("file_dictid {}".format(file_dictid))
-                   if recType == FSTREAM_CLOSE:
-                       #print("parse CLOSE")
-                       forceClose = False
-                       if recFlag & recFlag_forced:
-                           forceClose = True
-                       #print("Forced close: {}".format(forceClose))
+                       #print("XrdXrootdMonFileTOD: tBeg {}, tEnd {}".format(timestamp['tBeg'], timestamp['tEnd']))
+                       #print("Requests: {} XFr, {} total".format(isXfrReqs, totalReqs))
                        
-                       #first 24 bytes will always be XrdXrootdMonStatXFR
-                       XFR = struct.unpack("!QQQ", msg[:24]) 
+                   elif recType == FSTREAM_DISC:
+                       user_dictid, = struct.unpack("!I", header[4:])
+                       uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
+                       #print("XrdXrootdMonFileDSC: user_dictid {}".format(user_dictid))
+                   else:
+                       # all other types have the file dictid in the header
+                       file_dictid, = struct.unpack("!I", header[4:])
+                       uniq_id = "%s-%i.%i" % (addr[0], stod, file_dictid)
+                       #print("file_dictid {}".format(file_dictid))
+                       if recType == FSTREAM_CLOSE:
+                           #print("parse CLOSE")
+                           forceClose = False
+                           if recFlag & recFlag_forced:
+                               forceClose = True
+                           #print("Forced close: {}".format(forceClose))
+                           
+                           #first 24 bytes will always be XrdXrootdMonStatXFR
+                           XFR = struct.unpack("!QQQ", msg[:24]) 
     
-                       OPS = None
-                       if recFlag & recFlag_hasOPS:
-                           # ops will be the next 48 bytes
-                           OPS = struct.unpack("!IIIHHQIIIIII", msg[24:72])
+                           OPS = None
+                           if recFlag & recFlag_hasOPS:
+                               # ops will be the next 48 bytes
+                               OPS = struct.unpack("!IIIHHQIIIIII", msg[24:72])
     
-                       SSQ = None
-                       #TODO handle SSQ data
-                       #if recFlag & recFlag_hasSSQ:
-                       #    print("SSQ present")
+                           SSQ = None
+                           #TODO handle SSQ data
+                           #if recFlag & recFlag_hasSSQ:
+                           #    print("SSQ present")
     
-                       add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, OPS, SSQ)
-                       #print(req_pos)
-    
-    
-                   elif recType == FSTREAM_OPEN:
-                       #print("parse OPEN")
-                       fileOpenSize,  = struct.unpack("!Q", msg[:8])
-                       if recFlag & recFlag_hasRW:
-                           openedRW = True
-                       openedRW = False
-                       hasLFN = False
-                       lfn = None
-                       user_uniq_id = None
-                       if recFlag & recFlag_hasLFN:
-                           hasLFN = True
-                           user_dictid, = struct.unpack("!I", msg[8:12])
-                           user_uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
-                           lfn = msg[12:].decode().split('\x00', 1)[0] # the rest of the message should be the logical filename, with null bytes after
-                       add_fstream_open_info(uniq_id, addr, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_uniq_id, lfn)
-                       #print(req_pos)
-                       #print("user_dictid {}".format(user_dictid))
-                       #print("lfn {} opened RW {}".format(lfn, openedRW))
-                   #elif recType == FSTREAM_XFR:
-                       #print("parse XFR")
-               #print("recType {} recSize {} req_pos {}, {} bytes left of the packet".format(recTval[recType], recSize, req_pos, len(rest)))
-               req_pos = req_pos + 1
+                           add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, OPS, SSQ)
+                           #print(req_pos)
     
     
+                       elif recType == FSTREAM_OPEN:
+                           #print("parse OPEN")
+                           fileOpenSize,  = struct.unpack("!Q", msg[:8])
+                           if recFlag & recFlag_hasRW:
+                               openedRW = True
+                           openedRW = False
+                           hasLFN = False
+                           lfn = None
+                           user_uniq_id = None
+                           if recFlag & recFlag_hasLFN:
+                               hasLFN = True
+                               user_dictid, = struct.unpack("!I", msg[8:12])
+                               user_uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
+                               lfn = msg[12:].decode().split('\x00', 1)[0] # the rest of the message should be the logical filename, with null bytes after
+                           add_fstream_open_info(uniq_id, addr, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_uniq_id, lfn)
+                           #print(req_pos)
+                           #print("user_dictid {}".format(user_dictid))
+                           #print("lfn {} opened RW {}".format(lfn, openedRW))
+                       #elif recType == FSTREAM_XFR:
+                           #print("parse XFR")
+                   #print("recType {} recSize {} req_pos {}, {} bytes left of the packet".format(recTval[recType], recSize, req_pos, len(rest)))
+                   req_pos = req_pos + 1
+        except:
+            pass # something went wrong during parsing, do nothing
 
 # check for (and return) an fstream open event, first in memory, and then in elastic search
 def find_open_info ( file_uniq_id, es, es_doc_type):
