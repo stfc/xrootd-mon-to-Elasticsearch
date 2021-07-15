@@ -15,6 +15,14 @@ If both the open and close messages are present when processing the close, the c
    1. We don't get individual timestamps for messages, just a beginning and end timestamp for all messages in the reporting interval (the 10s in the monitoring directive below). We derive a likely timestamp based on the two times and the position of the message in the bundle, but the accuracy depends heavily on the size of the reporting interval and the number of events that occurred in the interval.
    2. The client is not guaranteed to be transferring data just because the file is open. For some transfers (e.g. an xrdcp) this is mostly true and the derived read/write rates are reasonably accurate, but for clients opening the file, doing a readV, doing some processing, doing another readV etc. the derived rates can be very low.
 
+## Dependencies
+
+This script has been tested on python 3.6. The only dependency is the python elasticsearch6 client which can be installed via pip or yum (if on centos 7):
+
+```
+        yum install python36-elasticsearch6
+```
+
 ## Configuration
 
 The xrootd monitoring incantation needed to get the right messages for this collector is:
