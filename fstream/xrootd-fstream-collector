@@ -1,0 +1,755 @@
+#!/usr/bin/python3
+# 
+# Written by Tom Byrne 2021
+# This script started life as a tstream collector written by Andrew Lahiff,
+# but has been heavily modified to use the fstream messages, and to reduce memory requirements on the collector box
+
+# incantation to get the right messages out of an xrootd server for this script:
+# xrootd.monitor all auth fstat 10s ops lfn xfr 5 ident 5m dest fstat info user redir IP:PORT
+
+import re
+import ssl
+import time
+import socket
+import struct
+import urllib3
+import datetime
+import optparse
+import threading
+import collections
+from elasticsearch6 import Elasticsearch, helpers
+from elasticsearch6.connection import create_ssl_context
+
+SITE_NAME_OVERRIDES = [ "pic" , "cea" , "lrz", "bu", "unl" ]
+DOMAIN_NAME_OVERRIDES = [ "computecanada", "rl" ]
+
+def flatten(d, parent_key='', sep='_'):
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if isinstance(v, collections.MutableMapping):
+            items.extend(flatten(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+def udp_server(data_handler, port=3334, bind="0.0.0.0"):
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_socket.bind((bind, port))
+    buf = 64*1024
+    while 1:
+        data, addr = server_socket.recvfrom(buf)
+        try:
+            data_handler.handle(data, addr)
+        except:
+            raise
+
+def calc_time_from_timestamp(ts, rp):
+    # The FStream requests come in a bundle, which specifies the time of the first packet, and the send time
+    # We can use this, along with the number of requests in the packet, to estimate a time for a particular req
+    req_count = ts['req_count']
+    if req_count > 1:
+        duration = float(ts['tEnd'] - ts['tBeg'])
+        req_len = duration / float(req_count)
+        req_time = float(ts['tBeg']) + (req_len * (rp - 1))
+        #print("tBeg {} tEnd {} duration {} num_req {} req_pos {} req_len {} time {}".format(ts['tBeg'], ts['tEnd'], duration, ts['req_count'], rp, req_len, req_time))
+    else:
+        req_time = ts['tBeg']
+    return req_time
+
+def trim_close_dict():
+    curr_time = time.time()
+    close_trim_time = curr_time - XRD_CLOSE_EXPIRE_TIME
+    
+    close_records_deleted = 0    
+    close_keys = fstream_close_dict.keys()
+    for file_uniq_id in close_keys:
+        if fstream_close_dict[file_uniq_id]['record_add_time'] < close_trim_time:
+            try:
+                del(fstream_close_dict[file_uniq_id])
+                close_records_deleted += 1
+            except:
+                print("already deleted")
+             
+        
+    if close_records_deleted > 0:
+        print("trim: {} close records deleted".format(close_records_deleted))
+
+def trim_user_and_open_dicts(cache_time):
+    curr_time = time.time()
+    open_trim_time = curr_time - cache_time
+    user_trim_time = curr_time - cache_time
+    # remove open_infos that have not had a close in the specified timeout
+    # also remove user_id keys from the temp list
+    
+    open_records_deleted = 0    
+    user_records_deleted = 0    
+    conn_keys = list(user_conn_dict.keys())
+    open_keys = list(fstream_open_dict.keys())
+    for file_uniq_id in open_keys:
+        if fstream_open_dict[file_uniq_id]['xrd_record_add_time'] < open_trim_time:
+            try:
+                del(fstream_open_dict[file_uniq_id])
+                fstream_open_sent.remove(file_uniq_id)
+                open_records_deleted += 1
+            except:
+                pass
+                #print("already deleted")
+        
+
+
+    # trim old user_info without associated open_info
+    for user_uniq_id in conn_keys:
+        if user_conn_dict[user_uniq_id]['xrd_record_add_time'] < user_trim_time:
+            # abandoned record, delete it
+            try:
+                del(user_conn_dict[user_uniq_id])
+                user_conn_sent.remove(user_uniq_id)
+                user_records_deleted += 1
+            except:
+                pass
+
+    if open_records_deleted > 0 or user_records_deleted > 0:
+        print("trim: {} open and {} user records deleted".format(open_records_deleted, user_records_deleted))
+
+def get_server_from_addr(addr):
+    try:
+        server = socket.gethostbyaddr(addr[0])[0]
+    except:
+        server = addr[0]
+    return server
+
+auth_info_dict = {
+'p': 'auth_protocol',
+'n': 'dn',
+'h': 'client_hostname',
+'o': 'org_name',
+'r': 'role_name',
+'g': 'group_names',
+'m': 'info',
+'x': 'xeqname',
+'y': 'xrd_moninfo',
+'I': 'ip_ver',
+'R': 'xrootd_ver',
+}
+auth_prefix = "xrd_auth"
+
+def add_user_conn_record(uniq_id, info, addr):
+    decoded_info = info.decode()
+    record = {}
+    record['xrd_msg_type'] = "user_connection"
+    record['xrd_user_uniq_id'] = uniq_id
+    record['xrd_record_add_time'] = time.time()
+    userid, info = decoded_info.split('\n')
+    record['xrd_prot'], userid = userid.split('/', 1)
+    record['xrd_user'], userid = userid.split('.', 1)
+    record['xrd_pid'], userid = userid.split(':', 1)
+    record['xrd_sid'], userid = userid.split('@', 1)
+    record['xrd_host'] = userid
+
+    info_array = info.split('&')
+    for i in info_array[1:]:
+        index, payload = i.split('=', 1)
+        token = auth_info_dict[index]
+        #payload_sane = payload.strip()
+        if payload:
+            record["{}_{}".format(auth_prefix, token)] = payload
+            #print("{}_{} {}".format(auth_prefix, token, payload))
+
+    record['xrd_server'] = get_server_from_addr(addr)
+
+    hostname = record['xrd_host']
+    try:
+        if hostname:
+            hostname = socket.gethostbyaddr(hostname)[0]
+    except:
+        pass
+    record['xrd_client'] = hostname
+
+    ishostname = bool(re.match("[a-z]+", hostname))
+    if not ":" in hostname and ishostname:
+        fqdn_list = hostname.split(".")
+        tld = fqdn_list[-1]
+        next_domain = fqdn_list[-2]
+        if tld == "ralworker":
+            origin = tld
+        elif (len(next_domain) > 3 or next_domain in SITE_NAME_OVERRIDES) and next_domain not in DOMAIN_NAME_OVERRIDES:
+            origin = next_domain + "." + tld
+        elif fqdn_list[-3] not in DOMAIN_NAME_OVERRIDES:
+            origin = fqdn_list[-3] + "." + next_domain + "." + tld
+        else:
+            origin = fqdn_list[-4] + "." + fqdn_list[-3] + "." + next_domain + "." + tld
+        record['xrd_origin_site'] = origin
+
+    user_conn_dict[uniq_id] = record
+    #print(user_conn_dict)
+
+def add_fstream_open_info(uniq_id, addr, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_dictid=None, lfn=None):
+    record = {}
+    record['xrd_file_uniq_id'] = uniq_id
+    record['xrd_msg_type'] = "fstream_open"
+    record['xrd_record_add_time'] = time.time()
+    record['xrd_fileOpenSize'] = fileOpenSize
+    record['xrd_openedRW'] = openedRW
+    record['xrd_hasLFN'] = hasLFN
+    record['xrd_user_uniq_id'] = user_dictid
+    record['xrd_lfn'] = lfn
+    record['xrd_open_timestamp'] = timestamp
+    record['xrd_open_req_pos'] = req_pos
+    record['xrd_server'] = get_server_from_addr(addr)
+
+    record['xrd_derived_open_time'] = calc_time_from_timestamp(timestamp, req_pos)
+    
+    fstream_open_dict[uniq_id] = record
+    #print(fstream_open_dict)
+
+def add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, OPS, SSQ):
+    record = {}
+    record['xrd_file_uniq_id'] = uniq_id
+    record['xrd_msg_type'] = "fstream_close"
+    record['xrd_record_add_time'] = time.time()
+    record['xrd_forceClose'] = forceClose
+    record['xrd_close_timestamp'] = timestamp
+    record['xrd_close_req_pos'] = req_pos
+    record['xrd_derived_close_time'] = calc_time_from_timestamp(timestamp, req_pos)
+    record['xrd_server'] = get_server_from_addr(addr)
+    XFR_dict = {}
+    XFR_dict['read'], XFR_dict['readv'], XFR_dict['write'] = XFR
+    record['xrd_XFR'] = XFR_dict
+
+    if OPS != None:
+        OPS_dict = {}
+        OPS_dict['read'] = OPS[0]
+        OPS_dict['readv'] = OPS[1]
+        OPS_dict['write'] = OPS[2]
+        OPS_dict['rsMin'] = OPS[3]
+        OPS_dict['rsMax'] = OPS[4]
+        OPS_dict['rsegs'] = OPS[5]
+        OPS_dict['rdMin'] = OPS[6]
+        OPS_dict['rdMax'] = OPS[7]
+        OPS_dict['rvMin'] = OPS[8]
+        OPS_dict['rvMax'] = OPS[9]
+        OPS_dict['wrMin'] = OPS[10]
+        OPS_dict['wrMax'] = OPS[11]
+        record['xrd_OPS'] = OPS_dict
+
+    if SSQ != None:
+        #TODO implement SSQ handling
+        pass
+
+    fstream_close_dict[uniq_id] = record
+    #print(fstream_close_dict)
+
+user_conn_sent = []
+fstream_open_sent = []
+
+user_conn_dict = {}
+fstream_open_dict = {}
+fstream_close_dict = {}
+fstream_disc_dict = {}
+
+MonMapCodes = ('d', 'u', 'i')
+XROOTD_MON_OPEN = 0x80
+XROOTD_MON_APPID = 0xa0
+XROOTD_MON_CLOSE = 0xc0
+XROOTD_MON_DISC = 0xd0
+XROOTD_MON_WINDOW = 0xe0
+
+
+recFlag_forced  = 0x01 # If recFlag == isClose close due to disconnect
+recFlag_hasOPS  = 0x02 # If recFlag == isClose MonStatXFR + MonStatOPS
+recFlag_hasSSQ  = 0x04 # If recFlag == isClose XFR + OPS  + MonStatSSQ
+recFlag_hasLFN  = 0x01 # If recFlag == isOpen  the lfn is present
+recFlag_hasRW   = 0x02 # If recFlag == isOpen  file opened r/w
+recFlag_hasSID  = 0x01 # If recFlag == isTime sID is present (new rec)
+
+recTval = ["isClose", "isOpen", "isTime", "isXfr", "isDisc"]
+FSTREAM_CLOSE = 0
+FSTREAM_OPEN = 1
+FSTREAM_TIME = 2
+FSTREAM_XFR = 3
+FSTREAM_DISC = 4
+
+
+
+# Verify that we have the integer/long/short lengths we desire.
+assert struct.calcsize("!i") == 4
+assert struct.calcsize("!q") == 8
+
+class XrdMonHandler(object):
+
+    """
+    Handler for the XrdMon UDP packet format as documented here:
+    http://xrootd.slac.stanford.edu/doc/prod/xrd_monitoring.htm
+    """
+
+    def handle(self, data, addr):
+        header, rest = data[:8], data[8:]
+        # Parse header:
+        code, pseq, plen, stod = struct.unpack("!cchi", header)
+        result = None
+        #print("=== message recieved - type {}, length {} ===".format(code, plen))
+        if code == b'u':
+            info_len = plen-8-4
+            dictid, info = struct.unpack("!i%is" % info_len, rest)
+            uniq_id = "%s-%i.%i" % (addr[0], stod, dictid)
+            #print("uniq_id {}".format(uniq_id))
+            add_user_conn_record(uniq_id, info, addr)
+        elif code == b'f':
+           #print("=== fstream message start - length {} ===".format(plen))
+           timestamp = {}
+           req_pos = 0
+           while rest:
+               header, rest = rest[:8] , rest[8:]
+               recType, recFlag, recSize, = struct.unpack("!BBh", header[:4])
+               msgSize = recSize - 8 # the recSize includes the 8 byte header
+               msg, rest= rest[:msgSize], rest[msgSize:] 
+               #print("recType {} recFlag {} recSize {}".format(recTval[recType], recFlag, recSize))
+               # the fstream message headers vary depending on the type
+               if recType == FSTREAM_TIME:
+                   # this gets us the first message time, send time for the following messages
+                   # I'm not extracting the sID as we are currently not using it and it may not be present
+                   isXfrReqs, totalReqs = struct.unpack("!hh", header[4:]) # extract the 2nd half of the header
+                   timestamp['req_count'] = totalReqs - isXfrReqs # the XFR requests always come at the end, so can't be used to estimate time for the other requests
+                   timestamp['tBeg'], timestamp['tEnd'] = struct.unpack("!II", msg[:8]) 
+
+                   #print("XrdXrootdMonFileTOD: tBeg {}, tEnd {}".format(timestamp['tBeg'], timestamp['tEnd']))
+                   #print("Requests: {} XFr, {} total".format(isXfrReqs, totalReqs))
+                   
+               elif recType == FSTREAM_DISC:
+                   user_dictid, = struct.unpack("!I", header[4:])
+                   uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
+                   #print("XrdXrootdMonFileDSC: user_dictid {}".format(user_dictid))
+               else:
+                   # all other types have the file dictid in the header
+                   file_dictid, = struct.unpack("!I", header[4:])
+                   uniq_id = "%s-%i.%i" % (addr[0], stod, file_dictid)
+                   #print("file_dictid {}".format(file_dictid))
+                   if recType == FSTREAM_CLOSE:
+                       #print("parse CLOSE")
+                       forceClose = False
+                       if recFlag & recFlag_forced:
+                           forceClose = True
+                       #print("Forced close: {}".format(forceClose))
+                       
+                       #first 24 bytes will always be XrdXrootdMonStatXFR
+                       XFR = struct.unpack("!QQQ", msg[:24]) 
+    
+                       OPS = None
+                       if recFlag & recFlag_hasOPS:
+                           # ops will be the next 48 bytes
+                           OPS = struct.unpack("!IIIHHQIIIIII", msg[24:72])
+    
+                       SSQ = None
+                       #TODO handle SSQ data
+                       #if recFlag & recFlag_hasSSQ:
+                       #    print("SSQ present")
+    
+                       add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, OPS, SSQ)
+                       #print(req_pos)
+    
+    
+                   elif recType == FSTREAM_OPEN:
+                       #print("parse OPEN")
+                       fileOpenSize,  = struct.unpack("!Q", msg[:8])
+                       if recFlag & recFlag_hasRW:
+                           openedRW = True
+                       openedRW = False
+                       hasLFN = False
+                       lfn = None
+                       user_uniq_id = None
+                       if recFlag & recFlag_hasLFN:
+                           hasLFN = True
+                           user_dictid, = struct.unpack("!I", msg[8:12])
+                           user_uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
+                           lfn = msg[12:].decode().split('\x00', 1)[0] # the rest of the message should be the logical filename, with null bytes after
+                       add_fstream_open_info(uniq_id, addr, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_uniq_id, lfn)
+                       #print(req_pos)
+                       #print("user_dictid {}".format(user_dictid))
+                       #print("lfn {} opened RW {}".format(lfn, openedRW))
+                   #elif recType == FSTREAM_XFR:
+                       #print("parse XFR")
+               #print("recType {} recSize {} req_pos {}, {} bytes left of the packet".format(recTval[recType], recSize, req_pos, len(rest)))
+               req_pos = req_pos + 1
+    
+    
+
+# check for (and return) an fstream open event, first in memory, and then in elastic search
+def find_open_info ( file_uniq_id, es, es_doc_type):
+    open_query = {"query": { 
+                "bool" : { 
+                    "must" : [{
+                        "term": {
+                            "type": es_doc_type
+                        }},
+                        {"term" : { 
+                            "xrd_msg_type.keyword": "fstream_open"
+                        }},
+                        {"term" : { 
+                            "xrd_file_uniq_id.keyword": file_uniq_id
+                        }},
+                    ]
+                }
+            }
+        }
+
+    evt = {}
+
+    if file_uniq_id in fstream_open_dict:
+        evt.update(fstream_open_dict[file_uniq_id])
+    else:
+        today = datetime.datetime.utcnow()
+        yesterday = today - datetime.timedelta(days=1)
+        index = 'logstash-{},logstash-{}'.format( yesterday.strftime('%Y.%m.%d'), today.strftime('%Y.%m.%d') )
+        #print index
+        try:
+            result = es.search(index=index, doc_type='doc', body=open_query)
+        except Exception as e:
+            print("error retrieving documents from ES: {}".format(e))
+        
+
+        try:
+            count = result['hits']['total']
+        except:
+            count = 0
+        if count == 1:
+            try:
+                evt = result['hits']['hits'][0]['_source']
+                del evt['@timestamp']
+            except:
+                pass
+
+    # remove entries that will clash when merging
+    try:
+        del evt['xrd_record_add_time']
+        del evt['xrd_msg_type']
+    except:
+        pass
+
+    #print(evt)
+    return evt 
+
+
+def find_user_info ( user_uniq_id, es, es_doc_type):
+    user_conn_query = {"query": { 
+                "bool" : { 
+                    "must" : [{
+                        "term": {
+                            "type": es_doc_type
+                        }},
+                        {"term" : { 
+                            "xrd_msg_type.keyword": "user_connection"
+                        }},
+                        {"term" : { 
+                            "xrd_user_uniq_id.keyword": user_uniq_id
+                        }},
+                    ]
+                }
+            }
+        }
+
+    evt = {}
+
+    if user_uniq_id in user_conn_dict:
+        evt.update(user_conn_dict[user_uniq_id])
+    else:
+        today = datetime.datetime.utcnow()
+        yesterday = today - datetime.timedelta(days=1)
+        index = 'logstash-{},logstash-{}'.format( yesterday.strftime('%Y.%m.%d'), today.strftime('%Y.%m.%d') )
+        #print index
+        try:
+            result = es.search(index=index, doc_type='doc', body=user_conn_query)
+        except Exception as e:
+            print("error retrieving documents from ES: {}".format(e))
+        
+
+        try:
+            count = result['hits']['total']
+        except:
+            count = 0
+        if count == 1:
+            try:
+                evt = result['hits']['hits'][0]['_source']
+                del evt['@timestamp']
+            except:
+                pass
+
+    # remove entries that will clash when merging
+    try:
+        del evt['xrd_record_add_time']
+        del evt['xrd_msg_type']
+    except:
+        pass
+    return evt 
+
+def gen_open(event, es_doc_type, es):
+
+        index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d')
+        
+        if 'xrd_derived_open_time' in event:
+            timestamp = time.gmtime(event['xrd_derived_open_time'])
+        else:
+            timestamp = time.gmtime()
+        
+        data = {}
+        data['xrd_hasUserInfo'] = False
+
+        try:
+            user_conn_info = find_user_info(event['xrd_user_uniq_id'], es, es_doc_type)
+            #print(user_conn_info)
+            if 'xrd_prot' in user_conn_info:
+                data.update(user_conn_info)
+                data['xrd_hasUserInfo'] = True
+                #print("user info added")
+            #else:
+                #print("no user info found for file open {}, user id {}".format(event['xrd_file_uniq_id'], event['xrd_user_uniq_id']))
+        except Exception as e:
+            pass
+            #print("could not add user info for file open {} {}".format(event['xrd_file_uniq_id'], e))
+ 
+
+        data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['type'] = es_doc_type
+        data.update(event)
+
+       
+        flat_data = flatten(data)
+        #print(flat_data)
+        return flat_data
+        #es.index(index=index, doc_type='doc', body=flat_data)
+        #print("send summary: {} {}".format( flat_data['xrd_msg_type'], data['xrd_file_uniq_id']))
+
+def gen_close(event, es_doc_type, es):
+
+        index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d')
+        #print(event)
+        
+        if 'xrd_derived_close_time' in event:
+            timestamp = time.gmtime(event['xrd_derived_close_time'])
+        else:
+            timestamp = time.gmtime()
+        
+        data = {}
+        data['xrd_hasOpenInfo'] = False
+        data['xrd_hasUserInfo'] = False
+
+        try:
+            file_open_info = find_open_info(event['xrd_file_uniq_id'], es, es_doc_type)
+            #print(file_open_info)
+            if 'xrd_fileOpenSize' in file_open_info:
+                #print(file_open_info)
+                data.update(file_open_info)
+                data['xrd_hasOpenInfo'] = True
+                #print("open info added")
+            #else:
+                #print("no open info found for file close {}".format(event['xrd_file_uniq_id']))
+        except Exception as e:
+            pass
+            #print("could not add open info for file close {} {}".format(event['xrd_file_uniq_id'], e))
+
+        if data['xrd_hasUserInfo'] != True and data['xrd_hasOpenInfo'] == True:
+         
+            try:
+                user_conn_info = find_user_info(data['xrd_user_uniq_id'], es, es_doc_type)
+                #print(user_conn_info)
+                if 'xrd_user' in user_conn_info:
+                    data.update(user_conn_info)
+                    data['xrd_hasUserInfo'] = True
+                    #print("user info added")
+                #else:
+                    #print("no user info found for file open {}".format(event['xrd_file_uniq_id']))
+            except Exception as e:
+                pass
+                #print("could not add user info for file open {} {}".format(event['xrd_file_uniq_id'], e))
+        #else:
+            #print("user info added from open info")
+ 
+
+        data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['type'] = es_doc_type
+        data.update(event)
+        #print(data)
+
+        if data['xrd_hasOpenInfo'] == True:
+            derived = derive_transfer_stats(data)
+            data.update(derived)
+       
+        flat_data = flatten(data)
+        return flat_data
+        #es.index(index=index, doc_type='doc', body=flat_data)
+        #print("send summary: {} {}".format( flat_data['xrd_msg_type'], data['xrd_file_uniq_id']))
+
+def derive_transfer_stats(evt):
+    derived = { "xrd_hasDerivedStats" : False }
+    try:
+        duration = float(evt['xrd_derived_close_time'] - evt['xrd_derived_open_time'])
+        if duration > 0:
+            derived['xrd_derived_duration'] = duration
+            derived['xrd_hasDerivedStats'] = True
+
+            derived['xrd_derived_write_rate'] = evt['xrd_XFR']['write'] / duration
+            derived['xrd_derived_read_rate'] = evt['xrd_XFR']['read'] / duration
+            derived['xrd_derived_readv_rate'] = evt['xrd_XFR']['readv'] / duration
+            derived['xrd_derived_read_total_bytes'] = evt['xrd_XFR']['readv'] + evt['xrd_XFR']['read']
+            derived['xrd_derived_read_total_rate'] = derived['xrd_derived_read_total_bytes'] / duration
+            derived['xrd_derived_total_bytes'] = evt['xrd_XFR']['readv'] + evt['xrd_XFR']['read'] + evt['xrd_XFR']['write']
+            if derived['xrd_derived_total_bytes'] > 0:
+                derived['xrd_derived_data_transferred'] = True
+            else:
+                derived['xrd_derived_data_transferred'] = False
+
+            if evt['xrd_XFR']['write'] > 0:
+                derived['xrd_derived_is_write'] = True
+            else:
+                derived['xrd_derived_is_write'] = False
+
+            if evt['xrd_XFR']['read'] > 0:
+                derived['xrd_derived_is_read'] = True
+            else:
+                derived['xrd_derived_is_read'] = False
+
+            if evt['xrd_XFR']['readv'] > 0:
+                derived['xrd_derived_is_readv'] = True
+            else:
+                derived['xrd_derived_is_readv'] = False
+        #else:
+        #    print("zero length duration")
+        #    print(evt)
+    except Exception as e:
+        #print("error deriving stats: {}".format(e))
+        pass
+    return derived
+
+
+def gen_conn(event, es_doc_type):
+
+        index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d')
+        #print(index)
+        
+        timestamp = time.gmtime()
+        
+        data = {}
+        data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['type'] = es_doc_type
+        data.update(event)
+        
+        flat_data = flatten(data)
+        #print(flat_data)
+        #print("send summary: {} {}".format( flat_data['xrd_msg_type'], data['xrd_user_uniq_id']))
+        return flat_data
+
+def parse_opts():
+    parser = optparse.OptionParser()
+    parser.add_option("-p", "--port", help="UDP Port to listen on for " \
+        "messages. ", type="int", default=9931, dest="port")
+    parser.add_option("-b", "--bind", help="Listen for messages on a " \
+        "specific address; defaults to 0.0.0.0.", default="0.0.0.0", dest="bind")
+    parser.add_option("-s", "--servers", help="ES servers to send " \
+         "events to. Can specify multiple times, one working server will be used.", \
+         action="append", dest="es_servers")
+    parser.add_option("-c", "--cache-time", help="how long to keep " \
+         "events in memory.", default=3600, dest="cache_time")
+    parser.add_option("-e", "--evt-type", help="ES type field for the events (not the '_type'" \
+         "field, which should not be changed from 'doc')", default="xrd_fstream", dest="doc_type")
+    parser.add_option("-t", "--time", help="Time to collect messages " \
+         "before sending (seconds)", default=10, dest="sleep_time")
+    parser.add_option("-i", "--insecure", help="Disable SSL verification when connecting " \
+         "to ES", action="store_true", dest="insecure")
+
+    opts, args = parser.parse_args()
+    
+    return opts
+
+def main():
+    opts = parse_opts()
+
+    handler = XrdMonHandler()
+
+    try:
+        udpserverthread = threading.Thread(target=udp_server,args=(handler, opts.port, opts.bind))
+        udpserverthread.setDaemon(True)
+        udpserverthread.setName("xrootd monitor udp_server Thread")
+        udpserverthread.start()
+    finally:
+        print('udp setup finished')
+
+    # setup ES connection
+    if opts.insecure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        ssl_context = create_ssl_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        es = Elasticsearch(hosts=opts.es_servers,
+                           scheme="https",
+                           verify_certs=False,
+                           ssl_context=ssl_context)
+    else:
+        es = Elasticsearch(hosts=opts.es_servers,
+                           scheme="https",
+                           verify_certs=True)
+
+    try:
+        while True:
+            try:
+                print("will send new data to Elasticsearch in {} seconds.".format(opts.sleep_time))
+                time.sleep(int(opts.sleep_time))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            sent_users = 0
+            sent_opens = 0
+            sent_closes = 0
+            print("=== {} close {} open {} user events in memory at start of send ===".format(len(fstream_close_dict), len(fstream_open_dict), len(user_conn_dict)))
+            user_ids = user_conn_dict.keys()
+            unsent_user_ids = list(set(user_ids).difference(user_conn_sent)) 
+            print("{} user conn events, {} to send. adding to send list".format(len(user_ids), len(unsent_user_ids)))
+
+            # process user events
+            to_send = []
+            for uniq_id in unsent_user_ids:
+                to_send += [gen_conn(user_conn_dict[uniq_id], opts.doc_type)]
+                user_conn_sent.append(uniq_id)
+                sent_users += 1
+
+            # process open events
+            open_ids = fstream_open_dict.keys()
+            unsent_open_ids = list(set(open_ids).difference(fstream_open_sent))
+            print("{} open events, {} to send. adding to send list".format(len(open_ids), len(unsent_open_ids)))
+            for uniq_id in unsent_open_ids:
+                to_send += [gen_open(fstream_open_dict[uniq_id], opts.doc_type, es)]
+                fstream_open_sent.append(uniq_id)
+                sent_opens += 1
+
+            # process close events
+            close_ids = list(fstream_close_dict.keys())
+            print("adding all {} close events to send list".format(len(close_ids)))
+            for uniq_id in close_ids:
+                to_send += [gen_close(fstream_close_dict[uniq_id], opts.doc_type, es)]
+                del fstream_close_dict[uniq_id]
+                sent_closes += 1
+
+            # send all in one go
+            print("{} items to send. sending...".format(len(to_send)))
+            index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d') 
+            resp = helpers.bulk(
+                es,
+                to_send,
+                index = index,
+                doc_type = "doc"
+            )
+
+            # print the response returned by Elasticsearch (normally just the number of events indexed)
+            print("send finished, response from ES: {}".format(resp))
+
+            print("{} user {} open {} close sent".format(sent_users, sent_opens, sent_closes))
+
+            # trim caches
+            trim_user_and_open_dicts(int(opts.cache_time))
+    finally:
+        print('exiting')
+
+if __name__ == '__main__':
+    try:
+        main()
+    except:
+        #print('exiting due to exception')
+        raise
