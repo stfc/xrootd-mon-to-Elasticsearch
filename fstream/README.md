@@ -1,6 +1,6 @@
 # xrootd-fstream-collector
 
-This script collects xrootd monitoring from UDP and send to Elasticsearch.
+This script collects UDP packets from XRootD servers containing transfer summaries and other information, and indexes them in Elasticsearch.
 
 ## Detailed description
 
