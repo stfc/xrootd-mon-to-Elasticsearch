@@ -57,51 +57,30 @@ def calc_time_from_timestamp(ts, rp):
         req_time = ts['tBeg']
     return req_time
 
-def trim_close_dict():
+def trim_caches(cache_time):
     curr_time = time.time()
-    close_trim_time = curr_time - XRD_CLOSE_EXPIRE_TIME
-    
-    close_records_deleted = 0    
-    close_keys = fstream_close_dict.keys()
-    for file_uniq_id in close_keys:
-        if fstream_close_dict[file_uniq_id]['record_add_time'] < close_trim_time:
-            try:
-                del(fstream_close_dict[file_uniq_id])
-                close_records_deleted += 1
-            except:
-                print("already deleted")
-             
-        
-    if close_records_deleted > 0:
-        print("trim: {} close records deleted".format(close_records_deleted))
+    trim_time = curr_time - cache_time
 
-def trim_user_and_open_dicts(cache_time):
-    curr_time = time.time()
-    open_trim_time = curr_time - cache_time
-    user_trim_time = curr_time - cache_time
-    # remove open_infos that have not had a close in the specified timeout
-    # also remove user_id keys from the temp list
     
+    ident_records_deleted = 0    
     open_records_deleted = 0    
     user_records_deleted = 0    
+
+    ident_keys = list(server_ident_dict.keys())
     conn_keys = list(user_conn_dict.keys())
     open_keys = list(fstream_open_dict.keys())
-    for file_uniq_id in open_keys:
-        if fstream_open_dict[file_uniq_id]['xrd_record_add_time'] < open_trim_time:
+
+    for sid in ident_keys:
+        if server_ident_dict[sid]['xrd_record_add_time'] < trim_time:
             try:
-                del(fstream_open_dict[file_uniq_id])
-                fstream_open_sent.remove(file_uniq_id)
-                open_records_deleted += 1
+                del(server_ident_dict[sid])
+                server_ident_sent.remove(sid)
+                ident_records_deleted += 1
             except:
                 pass
-                #print("already deleted")
-        
 
-
-    # trim old user_info without associated open_info
     for user_uniq_id in conn_keys:
-        if user_conn_dict[user_uniq_id]['xrd_record_add_time'] < user_trim_time:
-            # abandoned record, delete it
+        if user_conn_dict[user_uniq_id]['xrd_record_add_time'] < trim_time:
             try:
                 del(user_conn_dict[user_uniq_id])
                 user_conn_sent.remove(user_uniq_id)
@@ -109,8 +88,17 @@ def trim_user_and_open_dicts(cache_time):
             except:
                 pass
 
-    if open_records_deleted > 0 or user_records_deleted > 0:
-        print("trim: {} open and {} user records deleted".format(open_records_deleted, user_records_deleted))
+    for file_uniq_id in open_keys:
+        if fstream_open_dict[file_uniq_id]['xrd_record_add_time'] < trim_time:
+            try:
+                del(fstream_open_dict[file_uniq_id])
+                fstream_open_sent.remove(file_uniq_id)
+                open_records_deleted += 1
+            except:
+                pass
+
+    if open_records_deleted > 0 or user_records_deleted > 0 or ident_records_deleted > 0:
+        print("trim: {} ident, {} open and {} user records deleted".format(ident_records_deleted, open_records_deleted, user_records_deleted))
 
 def get_server_from_addr(addr):
     try:
@@ -132,20 +120,66 @@ auth_info_dict = {
 'I': 'ip_ver',
 'R': 'xrootd_ver',
 }
-auth_prefix = "xrd_auth"
 
-def add_user_conn_record(uniq_id, info, addr):
+auth_prefix = "xrd_auth"
+svr_prefix = "xrd_svr"
+
+def add_ident_info(stod, info):
+    decoded_info = info.decode()
+    record = {}
+    record['xrd_msg_type'] = "server_ident"
+    record['xrd_record_add_time'] = time.time()
+    record['xrd_svr_stod'] = stod
+    userid, info = decoded_info.split('\n')
+    record['xrd_svr_prot'], userid = userid.split('/', 1)
+    record['xrd_svr_user'], userid = userid.split('.', 1)
+    record['xrd_svr_pid'], userid = userid.split(':', 1)
+    sid, userid = userid.split('@', 1)
+    record['xrd_svr_host'] = userid # this is the 'server hostname'
+    record['xrd_server'] = userid # duplicated for 'legacy' reasons
+
+    # the sid persists between restarts, so sid.stod should be unique 
+    uniq_id = "%s.%i" % (sid, stod)
+    record['xrd_svr_uniq_id'] = uniq_id
+    record['xrd_svr_sid'] = sid
+
+    info_array = info.split('&')
+    for i in info_array[1:]:
+        index, payload = i.split('=', 1)
+        if payload:
+            record["{}_{}".format(svr_prefix, index)] = payload
+
+    #print(record)
+    server_ident_dict[uniq_id] = record
+
+    # remove the 'sent' entry from the ident message
+    # to trigger a new event being indexed 
+    try:
+        server_ident_sent.remove(uniq_id)
+    except:
+        pass
+
+
+
+def add_user_conn_record(stod, info, dictid):
     decoded_info = info.decode()
     record = {}
     record['xrd_msg_type'] = "user_connection"
-    record['xrd_user_uniq_id'] = uniq_id
     record['xrd_record_add_time'] = time.time()
     userid, info = decoded_info.split('\n')
     record['xrd_prot'], userid = userid.split('/', 1)
     record['xrd_user'], userid = userid.split('.', 1)
     record['xrd_pid'], userid = userid.split(':', 1)
-    record['xrd_sid'], userid = userid.split('@', 1)
+    sid, userid = userid.split('@', 1)
     record['xrd_host'] = userid
+
+
+    uniq_id = "%s-%i.%i" % (sid, stod, dictid)
+    svr_uniq_id = "%s.%i" % (sid, stod)
+
+    record['xrd_svr_sid'] = sid
+    record['xrd_svr_uniq_id'] = svr_uniq_id
+    record['xrd_user_uniq_id'] = uniq_id
 
     info_array = info.split('&')
     for i in info_array[1:]:
@@ -156,7 +190,7 @@ def add_user_conn_record(uniq_id, info, addr):
             record["{}_{}".format(auth_prefix, token)] = payload
             #print("{}_{} {}".format(auth_prefix, token, payload))
 
-    record['xrd_server'] = get_server_from_addr(addr)
+    #record['xrd_server'] = get_server_from_addr(addr)
 
     hostname = record['xrd_host']
     try:
@@ -184,35 +218,48 @@ def add_user_conn_record(uniq_id, info, addr):
     user_conn_dict[uniq_id] = record
     #print(user_conn_dict)
 
-def add_fstream_open_info(uniq_id, addr, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_dictid=None, lfn=None):
+def add_fstream_open_info(file_dictid, sid, stod, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_dictid=None, lfn=None):
+
     record = {}
+    svr_uniq_id = "%s.%i" % (sid, stod)
+    record['xrd_svr_sid'] = sid
+    record['xrd_svr_uniq_id'] = svr_uniq_id
+
+    uniq_id = "%s-%i.%i" % (sid, stod, file_dictid)
+    user_uniq_id = "%s-%i.%i" % (sid, stod, user_dictid)
     record['xrd_file_uniq_id'] = uniq_id
     record['xrd_msg_type'] = "fstream_open"
     record['xrd_record_add_time'] = time.time()
     record['xrd_fileOpenSize'] = fileOpenSize
     record['xrd_openedRW'] = openedRW
     record['xrd_hasLFN'] = hasLFN
-    record['xrd_user_uniq_id'] = user_dictid
+    record['xrd_user_uniq_id'] = user_uniq_id
     record['xrd_lfn'] = lfn
-    record['xrd_open_timestamp'] = timestamp
-    record['xrd_open_req_pos'] = req_pos
-    record['xrd_server'] = get_server_from_addr(addr)
+    #record['xrd_open_timestamp'] = timestamp
+    #record['xrd_open_req_pos'] = req_pos
+    record['xrd_sid'] = sid
 
     record['xrd_derived_open_time'] = calc_time_from_timestamp(timestamp, req_pos)
     
     fstream_open_dict[uniq_id] = record
     #print(fstream_open_dict)
 
-def add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, OPS, SSQ):
+def add_fstream_close_info(file_dictid, sid, stod, timestamp, req_pos, forceClose, XFR, OPS, SSQ):
     record = {}
+
+    svr_uniq_id = "%s.%i" % (sid, stod)
+    record['xrd_svr_sid'] = sid
+    record['xrd_svr_uniq_id'] = svr_uniq_id
+
+    uniq_id = "%s-%i.%i" % (sid, stod, file_dictid)
     record['xrd_file_uniq_id'] = uniq_id
     record['xrd_msg_type'] = "fstream_close"
     record['xrd_record_add_time'] = time.time()
     record['xrd_forceClose'] = forceClose
-    record['xrd_close_timestamp'] = timestamp
-    record['xrd_close_req_pos'] = req_pos
+    #record['xrd_close_timestamp'] = timestamp
+    #record['xrd_close_req_pos'] = req_pos
     record['xrd_derived_close_time'] = calc_time_from_timestamp(timestamp, req_pos)
-    record['xrd_server'] = get_server_from_addr(addr)
+    record['xrd_sid'] = sid
     XFR_dict = {}
     XFR_dict['read'], XFR_dict['readv'], XFR_dict['write'] = XFR
     record['xrd_XFR'] = XFR_dict
@@ -240,9 +287,13 @@ def add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, O
     fstream_close_dict[uniq_id] = record
     #print(fstream_close_dict)
 
+
+
+server_ident_sent = []
 user_conn_sent = []
 fstream_open_sent = []
 
+server_ident_dict = {}
 user_conn_dict = {}
 fstream_open_dict = {}
 fstream_close_dict = {}
@@ -290,12 +341,18 @@ class XrdMonHandler(object):
             code, pseq, plen, stod = struct.unpack("!cchi", header)
             result = None
             #print("=== message recieved - type {}, length {} ===".format(code, plen))
-            if code == b'u':
+            if code == b'=':
+                info_len = plen-8-4
+                dictid, info = struct.unpack("!i%is" % info_len, rest)
+                #uniq_id = "%i.%i" % (stod, dictid)
+                add_ident_info(stod, info)
+                #print("uniq_id {}".format(uniq_id))
+            elif code == b'u':
                 info_len = plen-8-4
                 dictid, info = struct.unpack("!i%is" % info_len, rest)
                 uniq_id = "%s-%i.%i" % (addr[0], stod, dictid)
                 #print("uniq_id {}".format(uniq_id))
-                add_user_conn_record(uniq_id, info, addr)
+                add_user_conn_record(stod, info, dictid)
             elif code == b'f':
                #print("=== fstream message start - length {} ===".format(plen))
                timestamp = {}
@@ -309,22 +366,24 @@ class XrdMonHandler(object):
                    # the fstream message headers vary depending on the type
                    if recType == FSTREAM_TIME:
                        # this gets us the first message time, send time for the following messages
-                       # I'm not extracting the sID as we are currently not using it and it may not be present
                        isXfrReqs, totalReqs = struct.unpack("!hh", header[4:]) # extract the 2nd half of the header
                        timestamp['req_count'] = totalReqs - isXfrReqs # the XFR requests always come at the end, so can't be used to estimate time for the other requests
                        timestamp['tBeg'], timestamp['tEnd'] = struct.unpack("!II", msg[:8]) 
+
+                       if recFlag & recFlag_hasSID:
+                           sid = struct.unpack("!Q", msg[8:16])[0] # sID 
 
                        #print("XrdXrootdMonFileTOD: tBeg {}, tEnd {}".format(timestamp['tBeg'], timestamp['tEnd']))
                        #print("Requests: {} XFr, {} total".format(isXfrReqs, totalReqs))
                        
                    elif recType == FSTREAM_DISC:
                        user_dictid, = struct.unpack("!I", header[4:])
-                       uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
+                       uniq_id = "%s-%i.%i" % (sid, stod, user_dictid)
                        #print("XrdXrootdMonFileDSC: user_dictid {}".format(user_dictid))
                    else:
                        # all other types have the file dictid in the header
                        file_dictid, = struct.unpack("!I", header[4:])
-                       uniq_id = "%s-%i.%i" % (addr[0], stod, file_dictid)
+                       uniq_id = "%s-%i.%i" % (sid, stod, file_dictid)
                        #print("file_dictid {}".format(file_dictid))
                        if recType == FSTREAM_CLOSE:
                            #print("parse CLOSE")
@@ -346,7 +405,7 @@ class XrdMonHandler(object):
                            #if recFlag & recFlag_hasSSQ:
                            #    print("SSQ present")
     
-                           add_fstream_close_info(uniq_id, addr, timestamp, req_pos, forceClose, XFR, OPS, SSQ)
+                           add_fstream_close_info(file_dictid, sid, stod, timestamp, req_pos, forceClose, XFR, OPS, SSQ)
                            #print(req_pos)
     
     
@@ -358,13 +417,13 @@ class XrdMonHandler(object):
                            openedRW = False
                            hasLFN = False
                            lfn = None
-                           user_uniq_id = None
+                           user_dictid = None
                            if recFlag & recFlag_hasLFN:
                                hasLFN = True
                                user_dictid, = struct.unpack("!I", msg[8:12])
-                               user_uniq_id = "%s-%i.%i" % (addr[0], stod, user_dictid)
+                               #user_uniq_id = "%s-%i.%i" % (sid, stod, user_dictid)
                                lfn = msg[12:].decode().split('\x00', 1)[0] # the rest of the message should be the logical filename, with null bytes after
-                           add_fstream_open_info(uniq_id, addr, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_uniq_id, lfn)
+                           add_fstream_open_info(file_dictid, sid, stod, timestamp, req_pos, fileOpenSize, openedRW, hasLFN, user_dictid, lfn)
                            #print(req_pos)
                            #print("user_dictid {}".format(user_dictid))
                            #print("lfn {} opened RW {}".format(lfn, openedRW))
@@ -373,7 +432,7 @@ class XrdMonHandler(object):
                    #print("recType {} recSize {} req_pos {}, {} bytes left of the packet".format(recTval[recType], recSize, req_pos, len(rest)))
                    req_pos = req_pos + 1
         except:
-            pass # something went wrong during parsing, do nothing
+            pass
 
 # check for (and return) an fstream open event, first in memory, and then in elastic search
 def find_open_info ( file_uniq_id, es, es_doc_type):
@@ -483,6 +542,113 @@ def find_user_info ( user_uniq_id, es, es_doc_type):
         pass
     return evt 
 
+def find_server_ident (svr_uniq_id, es, es_doc_type):
+
+    server_ident_query = {
+       "size": 1,
+       "sort": [{
+               "@timestamp": {
+               "order": "desc"
+                   }
+           }],
+       "query": { 
+                "bool" : { 
+                    "must" : [{
+                        "term": {
+                            "type": es_doc_type
+                        }},
+                        {"term" : { 
+                            "xrd_msg_type.keyword": "server_ident"
+                        }},
+                        {"term" : { 
+                            "xrd_svr_uniq_id.keyword": svr_uniq_id
+                        }},
+                    ]
+                }
+            }
+        }
+
+    evt = {}
+
+    # if not present, try and repopulate the cache with the most recent ident message
+    if svr_uniq_id not in server_ident_dict:
+        today = datetime.datetime.utcnow()
+        yesterday = today - datetime.timedelta(days=1)
+        index = 'logstash-{},logstash-{}'.format( yesterday.strftime('%Y.%m.%d'), today.strftime('%Y.%m.%d') )
+        #print index
+        try:
+            result = es.search(index=index, doc_type='doc', body=server_ident_query)
+        except Exception as e:
+            print("error retrieving documents from ES: {}".format(e))
+
+        try:
+            count = result['hits']['total']
+        except:
+            count = 0
+        if count > 1:
+            try:
+                server_ident_dict[svr_uniq_id] = result['hits']['hits'][0]['_source']
+                server_ident_sent.append(svr_uniq_id) # we don't want to send it again, just to cache it
+                server_ident_dict[svr_uniq_id]['xrd_record_add_time'] = time.time() # update the added time so the cache trimming works
+                del server_ident_dict[svr_uniq_id]['@timestamp']
+            except:
+                pass
+
+    # make a copy of the ident event from the cache
+    # and remove entries that will clash when merging into another message
+    try:
+        evt.update(server_ident_dict[svr_uniq_id])
+        del evt['xrd_record_add_time']
+        del evt['xrd_msg_type']
+    except:
+        pass
+
+    return evt 
+
+def gen_ident(event, es_doc_type):
+        
+        timestamp = time.gmtime(event['xrd_record_add_time'])
+        
+        data = {}
+        data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['type'] = es_doc_type
+        data.update(event)
+        
+        flat_data = flatten(data)
+        #print(flat_data)
+        return flat_data
+
+def gen_conn(event, es_doc_type, es):
+
+        #index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d')
+        #print(index)
+        
+        timestamp = time.gmtime(event['xrd_record_add_time'])
+        
+        data = {}
+
+        data['xrd_hasSvrInfo'] = False
+        try:
+            server_ident_info = find_server_ident(event['xrd_svr_uniq_id'], es, es_doc_type)
+            if 'xrd_svr_host' in server_ident_info:
+                data.update(server_ident_info)
+                data['xrd_hasSvrInfo'] = True
+            else:
+                print("no svr info found for user conn {}".format(event['xrd_user_uniq_id']))
+        except Exception as e:
+            print("could not add svr info for user conn {} {}".format(event['xrd_user_uniq_id'], e))
+            pass
+ 
+
+        data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['type'] = es_doc_type
+        data.update(event)
+        
+        flat_data = flatten(data)
+        #print(flat_data)
+        #print("send summary: {} {}".format( flat_data['xrd_msg_type'], data['xrd_user_uniq_id']))
+        return flat_data
+
 def gen_open(event, es_doc_type, es):
 
         index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d')
@@ -490,10 +656,11 @@ def gen_open(event, es_doc_type, es):
         if 'xrd_derived_open_time' in event:
             timestamp = time.gmtime(event['xrd_derived_open_time'])
         else:
-            timestamp = time.gmtime()
+            timestamp = time.gmtime(event['xrd_record_add_time'])
         
         data = {}
         data['xrd_hasUserInfo'] = False
+        data['xrd_hasSvrInfo'] = False
 
         try:
             user_conn_info = find_user_info(event['xrd_user_uniq_id'], es, es_doc_type)
@@ -507,12 +674,22 @@ def gen_open(event, es_doc_type, es):
         except Exception as e:
             pass
             #print("could not add user info for file open {} {}".format(event['xrd_file_uniq_id'], e))
- 
+
+        if data['xrd_hasSvrInfo'] == False:
+            try:
+                server_ident_info = find_server_ident(event['xrd_svr_uniq_id'], es, es_doc_type)
+                if 'xrd_svr_host' in server_ident_info:
+                    data.update(server_ident_info)
+                    data['xrd_hasSvrInfo'] = True
+                else:
+                    print("no svr info found for file open {}".format(event['xrd_file_uniq_id']))
+            except Exception as e:
+                print("could not add svr info for file open {} {}".format(event['xrd_file_uniq_id'], e))
+                pass
 
         data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
         data['type'] = es_doc_type
         data.update(event)
-
        
         flat_data = flatten(data)
         #print(flat_data)
@@ -528,11 +705,12 @@ def gen_close(event, es_doc_type, es):
         if 'xrd_derived_close_time' in event:
             timestamp = time.gmtime(event['xrd_derived_close_time'])
         else:
-            timestamp = time.gmtime()
+            timestamp = time.gmtime(event['xrd_record_add_time'])
         
         data = {}
         data['xrd_hasOpenInfo'] = False
         data['xrd_hasUserInfo'] = False
+        data['xrd_hasSvrInfo'] = False
 
         try:
             file_open_info = find_open_info(event['xrd_file_uniq_id'], es, es_doc_type)
@@ -557,14 +735,23 @@ def gen_close(event, es_doc_type, es):
                     data.update(user_conn_info)
                     data['xrd_hasUserInfo'] = True
                     #print("user info added")
-                #else:
-                    #print("no user info found for file open {}".format(event['xrd_file_uniq_id']))
+                else:
+                    print("no user info found for file open {}".format(event['xrd_file_uniq_id']))
             except Exception as e:
+                print("could not add user info for file open {} {}".format(event['xrd_file_uniq_id'], e))
                 pass
-                #print("could not add user info for file open {} {}".format(event['xrd_file_uniq_id'], e))
-        #else:
-            #print("user info added from open info")
- 
+
+        if data['xrd_hasSvrInfo'] == False:
+            try:
+                server_ident_info = find_server_ident(event['xrd_svr_uniq_id'], es, es_doc_type)
+                if 'xrd_svr_host' in server_ident_info:
+                    data.update(server_ident_info)
+                    data['xrd_hasSvrInfo'] = True
+                else:
+                    print("no svr info found for file close {}".format(event['xrd_file_uniq_id']))
+            except Exception as e:
+                print("could not add svr info for file close {} {}".format(event['xrd_file_uniq_id'], e))
+                pass
 
         data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
         data['type'] = es_doc_type
@@ -577,7 +764,6 @@ def gen_close(event, es_doc_type, es):
        
         flat_data = flatten(data)
         return flat_data
-        #es.index(index=index, doc_type='doc', body=flat_data)
         #print("send summary: {} {}".format( flat_data['xrd_msg_type'], data['xrd_file_uniq_id']))
 
 def derive_transfer_stats(evt):
@@ -622,22 +808,6 @@ def derive_transfer_stats(evt):
     return derived
 
 
-def gen_conn(event, es_doc_type):
-
-        index = 'logstash-%s' % datetime.datetime.utcnow().strftime('%Y.%m.%d')
-        #print(index)
-        
-        timestamp = time.gmtime()
-        
-        data = {}
-        data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
-        data['type'] = es_doc_type
-        data.update(event)
-        
-        flat_data = flatten(data)
-        #print(flat_data)
-        #print("send summary: {} {}".format( flat_data['xrd_msg_type'], data['xrd_user_uniq_id']))
-        return flat_data
 
 def parse_opts():
     parser = optparse.OptionParser()
@@ -696,18 +866,29 @@ def main():
                 time.sleep(int(opts.sleep_time))
             except (KeyboardInterrupt, SystemExit):
                 raise
+            sent_ident = 0
             sent_users = 0
             sent_opens = 0
             sent_closes = 0
-            print("=== {} close {} open {} user events in memory at start of send ===".format(len(fstream_close_dict), len(fstream_open_dict), len(user_conn_dict)))
+            print("=== {} ident {} close {} open {} user events in memory at start of send ===".format(len(server_ident_dict), len(fstream_close_dict), len(fstream_open_dict), len(user_conn_dict)))
+            to_send = []
+            
+            # process server ident events
+            server_uniq_ids = server_ident_dict.keys()
+            unsent_server_uniq_ids = list(set(server_uniq_ids).difference(server_ident_sent)) 
+            print("{} server ident events, {} to send. adding to send list".format(len(server_uniq_ids), len(unsent_server_uniq_ids)))
+            for uniq_id in unsent_server_uniq_ids:
+                to_send += [gen_ident(server_ident_dict[uniq_id], opts.doc_type)]
+                server_ident_sent.append(uniq_id)
+                sent_ident += 1
+
+
+            # process user events
             user_ids = user_conn_dict.keys()
             unsent_user_ids = list(set(user_ids).difference(user_conn_sent)) 
             print("{} user conn events, {} to send. adding to send list".format(len(user_ids), len(unsent_user_ids)))
-
-            # process user events
-            to_send = []
             for uniq_id in unsent_user_ids:
-                to_send += [gen_conn(user_conn_dict[uniq_id], opts.doc_type)]
+                to_send += [gen_conn(user_conn_dict[uniq_id], opts.doc_type, es)]
                 user_conn_sent.append(uniq_id)
                 sent_users += 1
 
@@ -741,10 +922,10 @@ def main():
             # print the response returned by Elasticsearch (normally just the number of events indexed)
             print("send finished, response from ES: {}".format(resp))
 
-            print("{} user {} open {} close sent".format(sent_users, sent_opens, sent_closes))
+            print("{} ident {} user {} open {} close sent".format(sent_ident, sent_users, sent_opens, sent_closes))
 
             # trim caches
-            trim_user_and_open_dicts(int(opts.cache_time))
+            trim_caches(int(opts.cache_time))
     finally:
         print('exiting')
 
