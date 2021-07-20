@@ -22,6 +22,7 @@ from elasticsearch6.connection import create_ssl_context
 
 SITE_NAME_OVERRIDES = [ "pic" , "cea" , "lrz", "bu", "unl" ]
 DOMAIN_NAME_OVERRIDES = [ "computecanada", "rl" ]
+COLLECTOR_HOSTNAME = socket.getfqdn()
 
 def flatten(d, parent_key='', sep='_'):
     items = []
@@ -611,6 +612,7 @@ def gen_ident(event, es_doc_type):
         
         data = {}
         data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['xrd_collector_host'] = COLLECTOR_HOSTNAME
         data['type'] = es_doc_type
         data.update(event)
         
@@ -641,6 +643,7 @@ def gen_conn(event, es_doc_type, es):
  
 
         data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['xrd_collector_host'] = COLLECTOR_HOSTNAME
         data['type'] = es_doc_type
         data.update(event)
         
@@ -688,6 +691,7 @@ def gen_open(event, es_doc_type, es):
                 pass
 
         data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['xrd_collector_host'] = COLLECTOR_HOSTNAME
         data['type'] = es_doc_type
         data.update(event)
        
@@ -754,6 +758,7 @@ def gen_close(event, es_doc_type, es):
                 pass
 
         data['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", timestamp)
+        data['xrd_collector_host'] = COLLECTOR_HOSTNAME
         data['type'] = es_doc_type
         data.update(event)
         #print(data)
