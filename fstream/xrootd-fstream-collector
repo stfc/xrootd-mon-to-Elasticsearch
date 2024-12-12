@@ -17,8 +17,8 @@ import datetime
 import optparse
 import threading
 import collections
-from elasticsearch6 import Elasticsearch, helpers
-from elasticsearch6.connection import create_ssl_context
+from opensearchpy import OpenSearch, helpers
+from opensearchpy.connection import create_ssl_context
 
 SITE_NAME_OVERRIDES = [ "pic" , "cea" , "lrz", "bu", "unl" ]
 DOMAIN_NAME_OVERRIDES = [ "computecanada", "rl" ]
@@ -435,7 +435,7 @@ class XrdMonHandler(object):
         except:
             pass
 
-# check for (and return) an fstream open event, first in memory, and then in elastic search
+# check for (and return) an fstream open event, first in memory, and then in open search
 def find_open_info ( file_uniq_id, es, es_doc_type):
     open_query = {"query": { 
                 "bool" : { 
@@ -855,19 +855,19 @@ def main():
         ssl_context = create_ssl_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        es = Elasticsearch(hosts=opts.es_servers,
+        es = Opensearch(hosts=opts.es_servers,
                            scheme="https",
                            verify_certs=False,
                            ssl_context=ssl_context)
     else:
-        es = Elasticsearch(hosts=opts.es_servers,
+        es = Opensearch(hosts=opts.es_servers,
                            scheme="https",
                            verify_certs=True)
 
     try:
         while True:
             try:
-                print("will send new data to Elasticsearch in {} seconds.".format(opts.sleep_time))
+                print("will send new data to Opensearch in {} seconds.".format(opts.sleep_time))
                 time.sleep(int(opts.sleep_time))
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -924,7 +924,7 @@ def main():
                 doc_type = "doc"
             )
 
-            # print the response returned by Elasticsearch (normally just the number of events indexed)
+            # print the response returned by Opensearch (normally just the number of events indexed)
             print("send finished, response from ES: {}".format(resp))
 
             print("{} ident {} user {} open {} close sent".format(sent_ident, sent_users, sent_opens, sent_closes))
